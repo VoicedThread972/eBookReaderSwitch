@@ -7,6 +7,7 @@ extern "C" {
 }
 
 #include <iostream>
+#include <cmath>
 #include "BookReader.hpp"
 
 void Menu_OpenBook(char *path) {
@@ -23,7 +24,27 @@ void Menu_OpenBook(char *path) {
     Touch_Init(&touchInfo);*/
     hidInitializeTouchScreen();
 
-    s32 prev_touchcount=0;
+    const int tapCooldownMs = 220;
+    const int tapMaxDistance = 35;
+    const int tapMaxDurationMs = 250;
+    const int swipeMinDistance = 120;
+    const int holdBaseIntervalMs = 350;
+    const int holdMinIntervalMs = 70;
+    const int holdMoveTolerance = 45;
+
+    bool touchActive = false;
+    int touchStartX = 0;
+    int touchStartY = 0;
+    int touchLastX = 0;
+    int touchLastY = 0;
+    u64 touchStartTick = 0;
+    u64 lastTapTick = 0;
+
+    int touchHoldDirection = 0;
+    int touchHoldStepIndex = 1;
+    bool touchStartedAsPageTurn = false;
+    u64 touchLastHoldTurnTick = 0;
+
     bool helpMenu = false;
     
     // Configure our supported input layout: a single player with standard controller syles
@@ -35,6 +56,47 @@ void Menu_OpenBook(char *path) {
 
     while(result >= 0 && appletMainLoop()) {
         reader->draw(helpMenu);
+
+        auto apply_page_turn = [&](int direction, int step = 1) {
+            if (direction > 0) {
+                reader->next_page(step);
+            } else if (direction < 0) {
+                reader->previous_page(step);
+            }
+        };
+
+        auto page_turn_direction_for_point = [&](int x, int y) {
+            if (reader->currentPageLayout() == BookPageLayoutPortrait) {
+                if (x > 1000 && (y > 200 && y < 500)) return 1;
+                if (x < 280 && (y > 200 && y < 500)) return -1;
+            } else if (reader->currentPageLayout() == BookPageLayoutLandscape) {
+                if (y < 200) return -1;
+                if (y > 500) return 1;
+            }
+            return 0;
+        };
+
+        auto apply_swipe = [&](int direction) {
+            if (direction > 0) {
+                apply_page_turn(1);
+            } else if (direction < 0) {
+                apply_page_turn(-1);
+            }
+        };
+
+        auto apply_tap_non_turn = [&](int x, int y) {
+            if (reader->currentPageLayout() == BookPageLayoutPortrait) {
+                if (y < 200)
+                    reader->zoom_in();
+                else if (y > 500)
+                    reader->zoom_out();
+            } else if (reader->currentPageLayout() == BookPageLayoutLandscape) {
+                if (x > 1000 && (y > 200 && y < 500))
+                    reader->zoom_in();
+                else if (x < 280 && (y > 200 && y < 500))
+                    reader->zoom_out();
+            }
+        };
         
 	padUpdate(&pad);
 
@@ -44,47 +106,88 @@ void Menu_OpenBook(char *path) {
 
 	HidTouchScreenState state={0};
 	
-	if(hidGetTouchScreenStates(&state, 1)) {
-		if(state.count != prev_touchcount) {
-			prev_touchcount = state.count;
-		} 
-	}
+    if(hidGetTouchScreenStates(&state, 1)) {
+        if (state.count > 0 && !helpMenu) {
+            int x = state.touches[0].x;
+            int y = state.touches[0].y;
+            u64 now = armGetSystemTick();
+            if (!touchActive) {
+                touchActive = true;
+                touchStartX = x;
+                touchStartY = y;
+                touchStartTick = now;
 
-	for(s32 i=0; i<state.count; i++) {
-		if (state.touches[i].x > 1000 && (state.touches[i].y > 200 && state.touches[i].y < 500))
-			if (reader->currentPageLayout() == BookPageLayoutPortrait)
-				reader->next_page(1);
-			else if (reader->currentPageLayout() == BookPageLayoutLandscape)
-				reader->zoom_in();
+                touchHoldDirection = page_turn_direction_for_point(x, y);
+                touchStartedAsPageTurn = (touchHoldDirection != 0);
+                touchHoldStepIndex = 1;
+                touchLastHoldTurnTick = now;
+                if (touchHoldDirection != 0) {
+                    // A tap should always turn exactly one page immediately.
+                    apply_page_turn(touchHoldDirection);
+                }
+            }
 
-		if (state.touches[i].x < 280 && (state.touches[i].y > 200 && state.touches[i].y < 500))
-			if (reader->currentPageLayout() == BookPageLayoutPortrait)
-				reader->previous_page(1);
-			else if (reader->currentPageLayout() == BookPageLayoutLandscape)
-				reader->zoom_out();
+            touchLastX = x;
+            touchLastY = y;
 
-		if (state.touches[i].y < 200)
-			if (reader->currentPageLayout() == BookPageLayoutPortrait)
-				reader->zoom_in();
-			else if (reader->currentPageLayout() == BookPageLayoutLandscape)
-				reader->previous_page(1);
+            if (touchHoldDirection != 0) {
+                int moveDx = std::abs(x - touchStartX);
+                int moveDy = std::abs(y - touchStartY);
+                int currentDirection = page_turn_direction_for_point(x, y);
 
-		if (state.touches[i].y > 500)
-			if (reader->currentPageLayout() == BookPageLayoutPortrait)
-				reader->zoom_out();
-			else if (reader->currentPageLayout() == BookPageLayoutLandscape)
-				reader->next_page(1);
-	}
+                if (currentDirection == touchHoldDirection && moveDx <= holdMoveTolerance && moveDy <= holdMoveTolerance) {
+                    int nextIntervalMs = holdBaseIntervalMs / touchHoldStepIndex;
+                    if (nextIntervalMs < holdMinIntervalMs) {
+                        nextIntervalMs = holdMinIntervalMs;
+                    }
+
+                    int elapsedMs = (int)armTicksToNs(now - touchLastHoldTurnTick) / 1000000;
+                    if (elapsedMs >= nextIntervalMs) {
+                        apply_page_turn(touchHoldDirection);
+                        touchLastHoldTurnTick = now;
+                        touchHoldStepIndex++;
+                    }
+                } else {
+                    touchHoldDirection = 0;
+                }
+            }
+        } else if (state.count == 0 && touchActive && !helpMenu) {
+            int dx = touchLastX - touchStartX;
+            int dy = touchLastY - touchStartY;
+            int absDx = std::abs(dx);
+            int absDy = std::abs(dy);
+            u64 now = armGetSystemTick();
+            int durationMs = (int)armTicksToNs(now - touchStartTick) / 1000000;
+
+            bool isHorizontalSwipe = absDx >= swipeMinDistance && absDx > absDy;
+            bool isTap = absDx <= tapMaxDistance && absDy <= tapMaxDistance && durationMs <= tapMaxDurationMs;
+
+            if (isHorizontalSwipe && !touchStartedAsPageTurn) {
+                apply_swipe(dx > 0 ? 1 : -1);
+            } else if (isTap) {
+                int tapElapsedMs = (int)armTicksToNs(now - lastTapTick) / 1000000;
+                if (lastTapTick == 0 || tapElapsedMs >= tapCooldownMs) {
+                    apply_tap_non_turn(touchLastX, touchLastY);
+                    lastTapTick = now;
+                }
+            }
+
+            touchActive = false;
+            touchHoldDirection = 0;
+            touchHoldStepIndex = 1;
+            touchStartedAsPageTurn = false;
+        }
+    }
 
         if (!helpMenu && kDown & HidNpadButton_Left) {
             if (reader->currentPageLayout() == BookPageLayoutPortrait ) {
-                reader->previous_page(1);
+                apply_page_turn(-1);
             } else if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
                 reader->zoom_out();
             }
         } else if (!helpMenu && kDown & HidNpadButton_Right) {
             if (reader->currentPageLayout() == BookPageLayoutPortrait ) {
-                reader->next_page(1);
+                apply_page_turn(1);
             } else if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
                 reader->zoom_in();
             }
@@ -133,9 +236,9 @@ void Menu_OpenBook(char *path) {
         }
 
 	if (!helpMenu && kDown & HidNpadButton_LeftSR)
-		reader->next_page(10);
+        apply_page_turn(1);
 	else if (!helpMenu && kDown & HidNpadButton_LeftSL)
-		reader->previous_page(10);
+        apply_page_turn(-1);
 
         if (kUp & HidNpadButton_B) {
             if (helpMenu) {

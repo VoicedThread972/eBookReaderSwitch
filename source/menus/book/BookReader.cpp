@@ -165,7 +165,6 @@ void BookReader::draw(bool drawHelp) {
     if (drawHelp) { // Help menu
         int helpWidth = 680;
         int helpHeight = 365;
-        helpHeight -= 38; // Removed due to removing the skip forward page button prompt.
 
         if (!configDarkMode) { // Display a dimmed background if on light mode
             SDL_DrawRect(RENDERER, 0, 0, 1280, 720, SDL_MakeColour(50, 50, 50, 150));
@@ -184,8 +183,8 @@ void BookReader::draw(bool drawHelp) {
         SDL_DrawButtonPrompt(RENDERER, left_stick_up_down,     ROBOTO_25, textColor, "Page up/down.",                   textX, textY + 38 * 3, 35, 35, 5, 0);
         SDL_DrawButtonPrompt(RENDERER, button_y,               ROBOTO_25, textColor, "Rotate page.",                    textX, textY + 38 * 4, 35, 35, 5, 0);
         SDL_DrawButtonPrompt(RENDERER, button_x,               ROBOTO_25, textColor, "Keep status bar on.",             textX, textY + 38 * 5, 35, 35, 5, 0);
-        SDL_DrawButtonPrompt(RENDERER, button_dpad_left_right, ROBOTO_25, textColor, "Next/previous page.",             textX, textY + 38 * 6, 35, 35, 5, 0);
-        //SDL_DrawButtonPrompt(RENDERER, button_dpad_up_down,    ROBOTO_25, textColor, "Skip forward/backward 10 pages.", textX, textY + 38 * 7, 35, 35, 5, 0);
+        SDL_DrawButtonPrompt(RENDERER, button_dpad_left_right, ROBOTO_25, textColor, "Next/previous page.", textX, textY + 38 * 6, 35, 35, 5, 0);
+        SDL_DrawText(RENDERER, ROBOTO_20, textX + 5, textY + 38 * 7 + 2, textColor, "Touch: tap once = 1 page, hold = ZE/1, ZE/2, ZE/3 ...");
     }
 
     if (permStatusBar || --status_bar_visible_counter > 0)  {

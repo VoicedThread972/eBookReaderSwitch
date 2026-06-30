@@ -88,9 +88,6 @@ void PageLayout::render_page_to_texture(int num, bool reset_zoom) {
     }
     
     fz_pixmap *pix = fz_new_pixmap_from_page_contents(ctx, page, fz_scale(zoom, zoom), fz_device_rgb(ctx), 0);
-    if (configDarkMode) {
-        fz_invert_pixmap(ctx, pix);
-    }
 
     SDL_Surface *image = SDL_CreateRGBSurfaceFrom(pix->samples, pix->w, pix->h, pix->n * 8, pix->w * pix->n, 0x000000FF, 0x0000FF00, 0x00FF0000, 0);
     page_texture = SDL_CreateTextureFromSurface(RENDERER, image);
