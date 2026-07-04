@@ -58,17 +58,17 @@ ICON := icon.jpg
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS	:=	-g -std=c++17 -Wall -O2 -ffunction-sections \
+CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
 CFLAGS	+=	-D__SWITCH__ $(INCLUDE) `sdl2-config --cflags`
 
-CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions #-DDEBUG=1 -DEXPERIMENTAL=1
+CXXFLAGS	:= $(CFLAGS) -std=c++17 -fno-rtti -fno-exceptions #-DDEBUG=1 -DEXPERIMENTAL=1
 
 ASFLAGS	:=	-g $(ARCH)
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map),--wrap=chdir
 
-LIBS_REAL = stdc++fs SDL2_ttf SDL2_image png jpeg freetype webp z bz2 config nx mupdf mupdf-third
+LIBS_REAL = stdc++fs SDL2_gfx SDL2_ttf SDL2_image png jpeg freetype harfbuzz webp z bz2 config nx mupdf mupdf-third
 ## LIBS_REAL += mupdf_core mupdf_thirdparty
 
 ifeq (,$(NODEBUG))

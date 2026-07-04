@@ -68,7 +68,6 @@ void Menu_StartChoosing() {
 	padUpdate(&pad);
 
 	u64 kDown = padGetButtonsDown(&pad);
-	u64 kHeld = padGetButtons(&pad);
 	u64 kUp = padGetButtonsUp(&pad);
 
         if (!isWarningOnScreen && kDown & HidNpadButton_Plus) {

@@ -18,7 +18,8 @@ static inline void FreeTextureIfNeeded(SDL_Texture **texture)
 class PageLayout
 {
     public:
-        PageLayout(fz_document *doc, int current_page);
+        PageLayout(fz_document *doc, int current_page, bool spread_mode = true);
+        virtual ~PageLayout();
     
         int current_page()
         {
@@ -50,9 +51,12 @@ class PageLayout
         fz_rect page_bounds = fz_empty_rect;
         fz_point page_center = fz_make_point(0, 0);
         float min_zoom = 1, max_zoom = 1, zoom = 1;
+        bool spread_mode = false;
     
         SDL_Rect viewport;
         SDL_Texture *page_texture = NULL;
+        fz_rect second_page_bounds = fz_empty_rect;
+        SDL_Texture *second_page_texture = NULL;
 };
 
 #endif

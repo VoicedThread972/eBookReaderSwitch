@@ -2,7 +2,7 @@
 #include "common.h"
 #include <algorithm>
 
-LandscapePageLayout::LandscapePageLayout(fz_document *doc, int current_page):PageLayout(doc, current_page) {
+LandscapePageLayout::LandscapePageLayout(fz_document *doc, int current_page):PageLayout(doc, current_page, false) {
     int w = viewport.w;
     viewport.w = viewport.h;
     viewport.h = w;
@@ -31,6 +31,15 @@ void LandscapePageLayout::draw_page() {
 void LandscapePageLayout::move_page(float x, float y) {
     float w = page_bounds.x1 * zoom, h = page_bounds.y1 * zoom;
     
-    page_center.x = fmin(fmax(page_center.x + y, h / 2), viewport.h - h / 2);
-    page_center.y = fmin(fmax(page_center.y + x, viewport.w - w / 2), w / 2);
+    if (h <= viewport.h) {
+        page_center.x = viewport.h / 2;
+    } else {
+        page_center.x = fmin(fmax(page_center.x + y, viewport.h - h / 2), h / 2);
+    }
+
+    if (w <= viewport.w) {
+        page_center.y = viewport.w / 2;
+    } else {
+        page_center.y = fmin(fmax(page_center.y + x, viewport.w - w / 2), w / 2);
+    }
 }

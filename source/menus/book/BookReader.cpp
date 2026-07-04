@@ -16,7 +16,7 @@ extern "C"  {
 fz_context *ctx = NULL;
 int windowX, windowY;
 config_t *config = NULL;
-char* configFile = "/switch/eBookReader/saved_pages.cfg";
+const char* configFile = "/switch/eBookReader/saved_pages.cfg";
 
 static int load_last_page(const char *book_name)  {
     if (!config) {
