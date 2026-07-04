@@ -2,6 +2,7 @@
 #include "PageLayout.hpp"
 #include "LandscapePageLayout.hpp"
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <libconfig.h>
 
@@ -78,7 +79,7 @@ BookReader::BookReader(const char *path, int* result) {
 
         std::cout << "current_page = " << current_page << std::endl;
 
-        switch_current_page_layout(_currentPageLayout, current_page);
+        apply_rotation(0, current_page);
 
         if (current_page > 0) {
             show_status_bar();
@@ -101,12 +102,14 @@ void BookReader::previous_page(int n) {
     layout->previous_page(n);
     show_status_bar();
     save_last_page(book_name.c_str(), layout->current_page());
+    recompute_link_screen_rects();
 }
 
 void BookReader::next_page(int n) {
     layout->next_page(n);
     show_status_bar();
     save_last_page(book_name.c_str(), layout->current_page());
+    recompute_link_screen_rects();
 }
 
 void BookReader::zoom_in() {
@@ -121,37 +124,35 @@ void BookReader::zoom_out() {
 
 void BookReader::move_page_up() {
     layout->move_up();
+    recompute_link_screen_rects();
 }
 
 void BookReader::move_page_down() {
     layout->move_down();
+    recompute_link_screen_rects();
 }
 
 void BookReader::move_page_left() {
     layout->move_left();
+    recompute_link_screen_rects();
 }
 
 void BookReader::move_page_right() {
     layout->move_right();
+    recompute_link_screen_rects();
 }
 
 void BookReader::reset_page() {
     layout->reset();
     show_status_bar();
+    recompute_link_screen_rects();
 }
 
 void BookReader::switch_page_layout() {
-    switch (_currentPageLayout) {
-        case BookPageLayoutPortrait:
-            switch_current_page_layout(BookPageLayoutLandscape, 0);
-            break;
-        case BookPageLayoutLandscape:
-            switch_current_page_layout(BookPageLayoutPortrait, 0);
-            break;
-    }
+    apply_rotation(_rotation + 90, 0);
 }
 
-void BookReader::draw(bool drawHelp) {
+void BookReader::draw(bool drawHelp, const ReaderOverlay &overlay) {
     if (configDarkMode == true) {
         SDL_ClearScreen(RENDERER, BLACK);
     } else {
@@ -161,6 +162,25 @@ void BookReader::draw(bool drawHelp) {
     SDL_RenderClear(RENDERER);
     
     layout->draw_page();
+
+    // Draw link highlight rectangles.
+    if (overlay.show_link_rects && !cached_links_.empty()) {
+        SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_BLEND);
+        for (int i = 0; i < (int)cached_links_.size(); i++) {
+            const SDL_Rect &r = cached_links_[i].screen_rect;
+            if (r.w <= 0 || r.h <= 0) continue;
+            bool focused = (overlay.focused_link == i);
+            SDL_SetRenderDrawColor(RENDERER,
+                focused ? 100 : 50,
+                focused ? 180 : 120,
+                255,
+                focused ? 140 : 55);
+            SDL_RenderFillRect(RENDERER, &r);
+            SDL_SetRenderDrawColor(RENDERER, 80, 140, 255, focused ? 255 : 180);
+            SDL_RenderDrawRect(RENDERER, &r);
+        }
+        SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_NONE);
+    }
     
     if (drawHelp) { // Help menu
         int helpWidth = 680;
@@ -196,12 +216,12 @@ void BookReader::draw(bool drawHelp) {
         
         SDL_Color color = configDarkMode ? STATUS_BAR_DARK : STATUS_BAR_LIGHT;
         
-        if (_currentPageLayout == BookPageLayoutPortrait) {
+        if (currentPageLayout() == BookPageLayoutPortrait) {
             SDL_DrawRect(RENDERER, 0, 0, 1280, 45, SDL_MakeColour(color.r, color.g, color.b , 180));
             SDL_DrawText(RENDERER, ROBOTO_25, (1280 - title_width) / 2, (40 - title_height) / 2, WHITE, title);
             
             StatusBar_DisplayTime(false);
-        } else if (_currentPageLayout == BookPageLayoutLandscape) {
+        } else if (currentPageLayout() == BookPageLayoutLandscape) {
             SDL_DrawRect(RENDERER, 1280 - 45, 0, 45, 720, SDL_MakeColour(color.r, color.g, color.b , 180));
             int x = (1280 - title_width) - ((40 - title_height) / 2);
             int y = (720 - title_height) / 2;
@@ -209,6 +229,22 @@ void BookReader::draw(bool drawHelp) {
 
             StatusBar_DisplayTime(true);
         }
+    }
+
+    // Draw virtual cursor crosshair.
+    if (overlay.cursor_visible) {
+        int cx = overlay.cursor_x, cy = overlay.cursor_y;
+        bool over_link = !hit_link(cx, cy).empty();
+        SDL_SetRenderDrawBlendMode(RENDERER, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(RENDERER,
+            over_link ? 50  : 255,
+            over_link ? 220 : 255,
+            over_link ? 50  : 0,
+            255);
+        SDL_RenderDrawLine(RENDERER, cx - 15, cy, cx + 15, cy);
+        SDL_RenderDrawLine(RENDERER, cx, cy - 15, cx, cy + 15);
+        SDL_Rect dot = {cx - 2, cy - 2, 5, 5};
+        SDL_RenderFillRect(RENDERER, &dot);
     }
     
     
@@ -219,21 +255,95 @@ void BookReader::show_status_bar() {
     status_bar_visible_counter = 200;
 }
 
-void BookReader::switch_current_page_layout(BookPageLayout bookPageLayout, int current_page) {
+void BookReader::apply_rotation(int rotation, int current_page) {
     if (layout) {
         current_page = layout->current_page();
         delete layout;
         layout = NULL;
     }
     
-    _currentPageLayout = bookPageLayout;
+    _rotation = ((rotation % 360) + 360) % 360;
     
-    switch (bookPageLayout) {
-        case BookPageLayoutPortrait:
-            layout = new PageLayout(doc, current_page);
-            break;
-        case BookPageLayoutLandscape:
-            layout = new LandscapePageLayout(doc, current_page);
-            break;
+    if (_rotation == 0) {
+        // Upright: two-page spread (landscape reading on the handheld).
+        layout = new PageLayout(doc, current_page);
+    } else {
+        // 90/180/270: single page rotated clockwise by that many degrees.
+        layout = new LandscapePageLayout(doc, current_page, _rotation);
     }
+
+    load_page_links();
+}
+
+// ── Link implementation ───────────────────────────────────────────────────────
+
+void BookReader::load_page_links() {
+    cached_links_.clear();
+    if (!layout || !doc) return;
+
+    auto process = [&](int page_num, int page_index) {
+        if (page_num < 0) return;
+        fz_page *page = nullptr;
+        fz_try(ctx) { page = fz_load_page(ctx, doc, page_num); }
+        fz_catch(ctx) { return; }
+
+        fz_link *links = nullptr;
+        fz_try(ctx) { links = fz_load_links(ctx, page); }
+        fz_catch(ctx) { fz_drop_page(ctx, page); return; }
+
+        for (fz_link *l = links; l; l = l->next) {
+            if (!l->uri || !*l->uri) continue;
+            LinkInfo li;
+            li.uri        = l->uri;
+            li.page_rect  = l->rect;
+            li.page_num   = page_num;
+            li.page_index = page_index;
+            li.screen_rect = layout->page_rect_to_screen(l->rect, page_index);
+            if (li.screen_rect.w > 0 && li.screen_rect.h > 0)
+                cached_links_.push_back(std::move(li));
+        }
+        fz_drop_link(ctx, links);
+        fz_drop_page(ctx, page);
+    };
+
+    process(layout->current_page(), 0);
+    process(layout->second_page_number(), 1);
+}
+
+void BookReader::recompute_link_screen_rects() {
+    if (!layout) return;
+    for (auto &li : cached_links_)
+        li.screen_rect = layout->page_rect_to_screen(li.page_rect, li.page_index);
+}
+
+std::string BookReader::hit_link(int sx, int sy) const {
+    for (const auto &li : cached_links_) {
+        const SDL_Rect &r = li.screen_rect;
+        if (sx >= r.x && sx <= r.x + r.w && sy >= r.y && sy <= r.y + r.h)
+            return li.uri;
+    }
+    return "";
+}
+
+void BookReader::follow_link(const char *uri) {
+    if (!uri || !*uri || !layout || !doc) return;
+    // Ignore external links — Switch has no browser.
+    if (strncmp(uri, "http", 4) == 0 || strncmp(uri, "mailto:", 7) == 0) return;
+
+    fz_try(ctx) {
+        float xp = 0, yp = 0;
+        fz_location loc = fz_resolve_link(ctx, doc, uri, &xp, &yp);
+        int pn = fz_page_number_from_location(ctx, doc, loc);
+        if (pn >= 0 && pn < fz_count_pages(ctx, doc)) {
+            layout->go_to_page(pn);
+            show_status_bar();
+            save_last_page(book_name.c_str(), layout->current_page());
+            load_page_links();
+        }
+    }
+    fz_catch(ctx) { /* unresolvable link — silently ignore */ }
+}
+
+void BookReader::reload_links() {
+    load_page_links();
 }

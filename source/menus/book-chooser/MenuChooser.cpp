@@ -22,32 +22,32 @@ template <typename T> bool contains(list<T> & listOfElements, const T & element)
 	return it != listOfElements.end();
 }
 
+// Returns the lower-cased file extension (including the leading dot), or an
+// empty string when the file name has no extension. Safe for names without a
+// dot (find_last_of returns npos, which would otherwise make substr throw).
+static string lower_ext(const string & filename) {
+	size_t dot = filename.find_last_of('.');
+	if (dot == string::npos)
+		return "";
+
+	string ext = filename.substr(dot);
+	transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return tolower(c); });
+	return ext;
+}
+
 extern TTF_Font *ROBOTO_35, *ROBOTO_25, *ROBOTO_15;
 
 void Menu_StartChoosing() {
     int choosenIndex = 0;
     bool readingBook = false;
-    list<string> allowedExtentions = {".pdf", ".epub", ".cbz", ".xps"};
-    list<string> warnedExtentions = {".epub", ".cbz", ".xps"};
+    // All of these are handled natively by mupdf's document handlers, so there
+    // is nothing to warn about.
+    list<string> allowedExtentions = {".pdf", ".epub", ".cbz", ".xps", ".oxps", ".fb2"};
 
     string path = "/switch/eBookReader/books";
 
-    // Count the amount of allowed files
-    int amountOfFiles = 0;
-    for (const auto & entry : fs::directory_iterator(path)) {
-        string filename = entry.path().filename().string();
-        string extention = filename.substr(filename.find_last_of("."));
-
-        if (contains(allowedExtentions, extention)) {
-            amountOfFiles++;
-        }
-    }
-
-    bool isWarningOnScreen = false;
     int windowX, windowY;
     SDL_GetWindowSize(WINDOW, &windowX, &windowY);
-    int warningWidth = 700;
-    int warningHeight = 300;
 
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
 
@@ -57,6 +57,32 @@ void Menu_StartChoosing() {
     while(appletMainLoop()) {
         if (readingBook) {
             break;
+        }
+
+        // Rebuild the book list every frame so files added over USB/MTP while
+        // the app is open are picked up, and so a missing directory or files
+        // without an extension can never crash the iterator.
+        vector<string> books;
+        if (fs::exists(path) && fs::is_directory(path)) {
+            for (const auto & entry : fs::directory_iterator(path)) {
+                if (!entry.is_regular_file()) {
+                    continue;
+                }
+
+                string filename = entry.path().filename().string();
+                if (contains(allowedExtentions, lower_ext(filename))) {
+                    books.push_back(filename);
+                }
+            }
+            sort(books.begin(), books.end());
+        }
+        int amountOfFiles = (int) books.size();
+
+        // Keep the selection within range even if the file count changed.
+        if (amountOfFiles == 0) {
+            choosenIndex = 0;
+        } else {
+            choosenIndex = std::min(std::max(0, choosenIndex), amountOfFiles - 1);
         }
 
         SDL_Color textColor = configDarkMode ? WHITE : BLACK;
@@ -70,65 +96,29 @@ void Menu_StartChoosing() {
 	u64 kDown = padGetButtonsDown(&pad);
 	u64 kUp = padGetButtonsUp(&pad);
 
-        if (!isWarningOnScreen && kDown & HidNpadButton_Plus) {
+        if (kDown & HidNpadButton_Plus) {
             break;
         }
 
         if (kDown & HidNpadButton_B) {
-            if (!isWarningOnScreen) {
-                break;
-            } else {
-                isWarningOnScreen = false;
-            }
+            break;
         }
 
-        if (kDown & HidNpadButton_A) {
-            int bookIndex = 0;
-            for (const auto & entry : fs::directory_iterator(path)) {
-                string filename = entry.path().filename().string();
-                string extention = filename.substr(filename.find_last_of("."));
+        if ((kDown & HidNpadButton_A) && amountOfFiles > 0) {
+            string book = path + "/" + books[choosenIndex];
+            cout << "Opening book: " << book << endl;
 
-                if (contains(allowedExtentions, extention)) {
-                    if (bookIndex == choosenIndex) {
-                        if (contains(warnedExtentions, extention)) {
-                            /*#ifdef EXPERIMENTAL
-                                SDL_DrawImage(RENDERER, warning, 5, 10 + (40 * choosingIndex));
-                            #endif*/
-                            if (isWarningOnScreen) {
-                                goto OPEN_BOOK;
-                            } else {
-                                isWarningOnScreen = true;
-                            }
-                        } else {
-                            OPEN_BOOK:
-                                string book = path + "/" + filename;
-                                cout << "Opening book: " << book << endl;
-
-                                Menu_OpenBook((char*) book.c_str());
-                                readingBook = true;
-                                break;
-                        }
-                    }
-
-                    bookIndex++;
-                }
-            }
+            Menu_OpenBook((char*) book.c_str());
+            readingBook = true;
+            break;
         }
 
-        if (kDown & HidNpadButton_Up || kDown & HidNpadButton_StickRUp) {
-            if (choosenIndex != 0 && !isWarningOnScreen) {
-                choosenIndex--;
-            } else if (choosenIndex == 0) {
-                choosenIndex = amountOfFiles-1;
-            }
+        if ((kDown & HidNpadButton_Up || kDown & HidNpadButton_StickRUp) && amountOfFiles > 0) {
+            choosenIndex = (choosenIndex == 0) ? amountOfFiles - 1 : choosenIndex - 1;
         }
 
-        if (kDown & HidNpadButton_Down || kDown & HidNpadButton_StickRDown) {
-            if (choosenIndex == amountOfFiles-1) {
-                choosenIndex = 0;
-            } else if (choosenIndex < amountOfFiles-1 && !isWarningOnScreen) {
-                choosenIndex++;
-            }
+        if ((kDown & HidNpadButton_Down || kDown & HidNpadButton_StickRDown) && amountOfFiles > 0) {
+            choosenIndex = (choosenIndex == amountOfFiles - 1) ? 0 : choosenIndex + 1;
         }
 
         if (kUp & HidNpadButton_Minus) {
@@ -143,36 +133,16 @@ void Menu_StartChoosing() {
         TTF_SizeText(ROBOTO_20, "Switch Theme", &themeWidth, NULL);
         SDL_DrawButtonPrompt(RENDERER, button_minus, ROBOTO_20, textColor, "Switch Theme", windowX - themeWidth - 50, windowY - 40, 35, 35, 5, 0);
 
-        int choosingIndex = 0;
-        for (const auto & entry : fs::directory_iterator(path)) {
-            string filename = entry.path().filename().string();
-            string extention = filename.substr(filename.find_last_of("."));
+        if (amountOfFiles == 0) {
+            SDL_DrawText(RENDERER, ROBOTO_25, 70, 20, textColor, "No books found in /switch/eBookReader/books");
+        }
 
-            if (contains(allowedExtentions, extention)) {
-                if (choosenIndex == choosingIndex) {
-                    SDL_DrawRect(RENDERER, 15, 15 + (40 * choosingIndex), 1265, 40, configDarkMode ? SELECTOR_COLOUR_DARK : SELECTOR_COLOUR_LIGHT);
-                }
-
-                if (contains(warnedExtentions, extention)) {
-                    SDL_DrawImage(RENDERER, warning, 25, 18 + (40 * choosingIndex));
-                }
-                
-                SDL_DrawText(RENDERER, ROBOTO_25, 70, 20 + (40 * choosingIndex), textColor, entry.path().filename().c_str());
-
-                if (isWarningOnScreen) {
-                    if (!configDarkMode) { // Display a dimmed background if on light mode
-                        SDL_DrawRect(RENDERER, 0, 0, 1280, 720, SDL_MakeColour(50, 50, 50, 150));
-                    }
-
-                    SDL_DrawRect(RENDERER, (windowX - warningWidth) / 2, (windowY - warningHeight) / 2, warningWidth, warningHeight, configDarkMode ? HINT_COLOUR_DARK : HINT_COLOUR_LIGHT);
-                    SDL_DrawText(RENDERER, ROBOTO_30, (windowX - warningWidth) / 2 + 15, (windowY - warningHeight) / 2 + 15, textColor, "This file is not yet fully supported, and may");
-                    SDL_DrawText(RENDERER, ROBOTO_30, (windowX - warningWidth) / 2 + 15, (windowY - warningHeight) / 2 + 50, textColor, "cause a system, or app crash.");
-                    SDL_DrawText(RENDERER, ROBOTO_20, (windowX - warningWidth) / 2 + warningWidth - 250, (windowY - warningHeight) / 2 + warningHeight - 30, textColor, "\"A\" - Read");
-                    SDL_DrawText(RENDERER, ROBOTO_20, (windowX - warningWidth) / 2 + warningWidth - 125, (windowY - warningHeight) / 2 + warningHeight - 30, textColor, "\"B\" - Cancel.");
-                }
-
-                choosingIndex++;
+        for (int i = 0; i < amountOfFiles; i++) {
+            if (choosenIndex == i) {
+                SDL_DrawRect(RENDERER, 15, 15 + (40 * i), 1265, 40, configDarkMode ? SELECTOR_COLOUR_DARK : SELECTOR_COLOUR_LIGHT);
             }
+
+            SDL_DrawText(RENDERER, ROBOTO_25, 70, 20 + (40 * i), textColor, books[i].c_str());
         }
 
         SDL_RenderPresent(RENDERER);

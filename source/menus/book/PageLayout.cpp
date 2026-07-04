@@ -45,12 +45,15 @@ PageLayout::~PageLayout() {
 }
 
 void PageLayout::previous_page(int n) {
-    long long target = (long long)_current_page - n;
+    // In spread mode each "page turn" advances one spread = 2 document pages.
+    long long step = spread_mode ? (long long)n * 2 : n;
+    long long target = (long long)_current_page - step;
     render_page_to_texture((int)std::max<long long>(0, target), false);
 }
 
 void PageLayout::next_page(int n) {
-    long long target = (long long)_current_page + n;
+    long long step = spread_mode ? (long long)n * 2 : n;
+    long long target = (long long)_current_page + step;
     render_page_to_texture((int)std::min<long long>(pages_count - 1, target), false);
 }
 
@@ -222,4 +225,87 @@ void PageLayout::move_page(float x, float y) {
 
     page_center.x = clamp_page_center(page_center.x, x, w, viewport.w);
     page_center.y = clamp_page_center(page_center.y, y, h, viewport.h);
+}
+
+// ── New helpers ───────────────────────────────────────────────────────────────
+
+void PageLayout::go_to_page(int n) {
+    render_page_to_texture(std::min(std::max(0, n), pages_count - 1), false);
+}
+
+int PageLayout::second_page_number() const {
+    return (spread_mode && second_page_texture && _current_page + 1 < pages_count)
+           ? _current_page + 1 : -1;
+}
+
+// Returns the screen-space SDL_Rect for a link given in page-space coordinates.
+// page_index: 0 = left/only page, 1 = right page (spread mode only).
+SDL_Rect PageLayout::page_rect_to_screen(const fz_rect &r, int page_index) const {
+    float w  = page_bounds.x1        * zoom;
+    float h  = page_bounds.y1        * zoom;
+    float w2 = second_page_bounds.x1 * zoom;
+    float h2 = second_page_bounds.y1 * zoom;
+    float rx, ry;
+
+    if (spread_mode) {
+        bool  has2  = (second_page_texture != nullptr);
+        float total = w + (has2 ? PAGE_SPREAD_GUTTER + w2 : 0.f);
+        float left  = page_center.x - total / 2.f;
+        if (page_index == 0) {
+            rx = left;
+            ry = page_center.y - h / 2.f;
+        } else if (page_index == 1 && has2) {
+            rx = left + w + PAGE_SPREAD_GUTTER;
+            ry = page_center.y - h2 / 2.f;
+        } else {
+            return {0, 0, 0, 0};
+        }
+    } else {
+        if (page_index != 0) return {0, 0, 0, 0};
+        rx = page_center.x - w / 2.f;
+        ry = page_center.y - h / 2.f;
+    }
+
+    return {
+        (int)(rx + r.x0 * zoom),
+        (int)(ry + r.y0 * zoom),
+        (int)((r.x1 - r.x0) * zoom),
+        (int)((r.y1 - r.y0) * zoom)
+    };
+}
+
+// Maps a screen-space tap back to page-space coordinates.
+// Returns true when the point lies within the rendered page rect.
+bool PageLayout::screen_to_page_coords(int sx, int sy, int page_index,
+                                        float *px, float *py) const {
+    float w  = page_bounds.x1        * zoom;
+    float h  = page_bounds.y1        * zoom;
+    float w2 = second_page_bounds.x1 * zoom;
+    float h2 = second_page_bounds.y1 * zoom;
+    float rx, ry;
+    float max_x, max_y;
+
+    if (spread_mode) {
+        bool  has2  = (second_page_texture != nullptr);
+        float total = w + (has2 ? PAGE_SPREAD_GUTTER + w2 : 0.f);
+        float left  = page_center.x - total / 2.f;
+        if (page_index == 0) {
+            rx = left; ry = page_center.y - h  / 2.f;
+            max_x = page_bounds.x1; max_y = page_bounds.y1;
+        } else if (page_index == 1 && has2) {
+            rx = left + w + PAGE_SPREAD_GUTTER; ry = page_center.y - h2 / 2.f;
+            max_x = second_page_bounds.x1; max_y = second_page_bounds.y1;
+        } else {
+            return false;
+        }
+    } else {
+        if (page_index != 0) return false;
+        rx = page_center.x - w / 2.f;
+        ry = page_center.y - h / 2.f;
+        max_x = page_bounds.x1; max_y = page_bounds.y1;
+    }
+
+    *px = (sx - rx) / zoom;
+    *py = (sy - ry) / zoom;
+    return (*px >= 0.f && *py >= 0.f && *px <= max_x && *py <= max_y);
 }

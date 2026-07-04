@@ -37,6 +37,16 @@ class PageLayout
         virtual void reset();
         virtual void draw_page();
         virtual char* info();
+
+        // Page navigation.
+        void go_to_page(int n);
+        int  page_count()         const { return pages_count; }
+        int  second_page_number() const;
+
+        // Coordinate helpers used for link hit-testing and highlight drawing.
+        virtual SDL_Rect page_rect_to_screen(const fz_rect &r, int page_index) const;
+        virtual bool     screen_to_page_coords(int sx, int sy, int page_index,
+                                               float *px, float *py) const;
     
     protected:
         virtual void render_page_to_texture(int num, bool reset_zoom);

@@ -10,6 +10,7 @@ extern "C" {
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <string>
 #include "BookReader.hpp"
 
 static const int SCREEN_WIDTH = 1280;
@@ -159,6 +160,11 @@ void Menu_OpenBook(char *path) {
     bool helpMenu = false;
     TouchGesture touch = {0};
     PageHold buttonHold = {0};
+    // Virtual cursor (ZR + right stick) and link tab navigation (ZL + d-pad).
+    float cursor_x = 640.f, cursor_y = 360.f;
+    bool  cursor_mode    = false;
+    bool  link_tab_mode  = false;
+    int   focused_link   = -1;
     
     // Configure our supported input layout: a single player with standard controller syles
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -167,7 +173,21 @@ void Menu_OpenBook(char *path) {
     padInitializeDefault(&pad);
 
     while(result >= 0 && appletMainLoop()) {
-        reader->draw(helpMenu);
+        // Clamp focused link in case page changed since last frame.
+        if (link_tab_mode) {
+            int n = (int)reader->page_links().size();
+            if (n == 0)                                      focused_link = -1;
+            else if (focused_link < 0 || focused_link >= n)  focused_link = 0;
+        }
+
+        ReaderOverlay overlay;
+        overlay.show_link_rects = (cursor_mode || link_tab_mode) && !helpMenu;
+        overlay.focused_link    = link_tab_mode ? focused_link : -1;
+        overlay.cursor_visible  = cursor_mode && !helpMenu;
+        overlay.cursor_x        = (int)cursor_x;
+        overlay.cursor_y        = (int)cursor_y;
+
+        reader->draw(helpMenu, overlay);
         
 	padUpdate(&pad);
 
@@ -178,6 +198,19 @@ void Menu_OpenBook(char *path) {
 	HidTouchScreenState state={0};
     hidGetTouchScreenStates(&state, 1);
     Uint32 now = SDL_GetTicks();
+
+    // ── Virtual cursor movement via right stick ────────────────────────────
+    if (cursor_mode && !helpMenu) {
+        HidAnalogStickState rs = padGetStickPos(&pad, 1);
+        const int DZ = 3000;
+        auto axis = [DZ](int v) -> float {
+            if (v >  DZ) return  (float)(v - DZ) / (32767 - DZ);
+            if (v < -DZ) return  (float)(v + DZ) / (32767 - DZ);
+            return 0.f;
+        };
+        cursor_x = std::clamp(cursor_x + axis(rs.x) * 8.f, 0.f, 1279.f);
+        cursor_y = std::clamp(cursor_y - axis(rs.y) * 8.f, 0.f, 719.f);
+    }
 
     if (!helpMenu && state.count > 0) {
         HidTouchState current_touch = state.touches[0];
@@ -211,10 +244,17 @@ void Menu_OpenBook(char *path) {
             int direction = page_swipe_direction(reader->currentPageLayout(), dx, dy);
 
             if (direction == 0 && duration <= TAP_MAX_MS && abs(dx) <= TAP_SLOP && abs(dy) <= TAP_SLOP) {
-                direction = page_tap_direction(reader->currentPageLayout(), touch.start_x, touch.start_y);
+                // Hyperlink taps take priority over page-turn taps.
+                std::string link_uri = reader->hit_link(touch.start_x, touch.start_y);
+                if (!link_uri.empty()) {
+                    reader->follow_link(link_uri.c_str());
+                } else {
+                    direction = page_tap_direction(reader->currentPageLayout(), touch.start_x, touch.start_y);
+                    turn_pages(reader, direction, 1);
+                }
+            } else {
+                turn_pages(reader, direction, 1);
             }
-
-            turn_pages(reader, direction, 1);
         }
 
         touch.active = false;
@@ -236,19 +276,67 @@ void Menu_OpenBook(char *path) {
             reset_page_hold(&buttonHold);
         }
 
+        // ── ZR: toggle virtual cursor mode (right stick moves cursor, A follows) ──
+        if (!helpMenu && (kDown & HidNpadButton_ZR)) {
+            cursor_mode = !cursor_mode;
+            if (cursor_mode) {
+                link_tab_mode = false;
+                focused_link  = -1;
+                cursor_x = 640.f; cursor_y = 360.f;
+            }
+        }
+
+        // ── ZL: toggle link tab-navigation mode (d-pad cycles, A follows) ──────
+        if (!helpMenu && (kDown & HidNpadButton_ZL)) {
+            link_tab_mode = !link_tab_mode;
+            if (link_tab_mode) {
+                cursor_mode  = false;
+                const auto &lks = reader->page_links();
+                focused_link = lks.empty() ? -1 : 0;
+            } else {
+                focused_link = -1;
+            }
+        }
+
+        // ── A: follow focused/hovered link ───────────────────────────────────────
+        if (!helpMenu && (kDown & HidNpadButton_A)) {
+            if (cursor_mode) {
+                std::string uri = reader->hit_link((int)cursor_x, (int)cursor_y);
+                if (!uri.empty()) {
+                    reader->follow_link(uri.c_str());
+                    cursor_mode = false;
+                }
+            } else if (link_tab_mode && focused_link >= 0) {
+                const auto &lks = reader->page_links();
+                if (focused_link < (int)lks.size())
+                    reader->follow_link(lks[focused_link].uri.c_str());
+                link_tab_mode = false;
+                focused_link  = -1;
+            }
+        }
+
+        // ── D-pad cycles links in tab mode (up/down repurposed when tab active) ─
+        if (!helpMenu && link_tab_mode) {
+            int n = (int)reader->page_links().size();
+            if (n > 0) {
+                if (kDown & HidNpadButton_Down) focused_link = (focused_link + 1) % n;
+                if (kDown & HidNpadButton_Up)   focused_link = ((focused_link - 1) + n) % n;
+            }
+        }
+
         if (!helpMenu && kDown & HidNpadButton_R) {
             reader->next_page(10);
         } else if (!helpMenu && kDown & HidNpadButton_L) {
             reader->previous_page(10);
         }
 
-        if (!helpMenu && ((kDown & HidNpadButton_Up) || (kHeld & HidNpadButton_StickRUp))) {
+        if (!helpMenu && !link_tab_mode && ((kDown & HidNpadButton_Up) || (!cursor_mode && kHeld & HidNpadButton_StickRUp))) {
             if (reader->currentPageLayout() == BookPageLayoutPortrait ) {
                 reader->zoom_in();
             } else if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
                 reader->previous_page(1);
             }
-        } else if (!helpMenu && ((kDown & HidNpadButton_Down) || (kHeld & HidNpadButton_StickRDown))) {
+        } else if (!helpMenu && !link_tab_mode && ((kDown & HidNpadButton_Down) || (!cursor_mode && kHeld & HidNpadButton_StickRDown))) {
             if (reader->currentPageLayout() == BookPageLayoutPortrait ) {
                 reader->zoom_out();
             } else if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
