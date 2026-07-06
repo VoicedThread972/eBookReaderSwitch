@@ -79,9 +79,8 @@ SDL_Rect LandscapePageLayout::page_rect_to_screen(const fz_rect &r, int page_ind
     float dx = pre_x - cx, dy = pre_y - cy;
     float sx, sy;
     switch (_angle) {
-        case  90: sx = -dy + cx; sy =  dx + cy; break;
-        case 180: sx = -dx + cx; sy = -dy + cy; break;
-        case 270: sx =  dy + cx; sy = -dx + cy; break;
+        case  90: sx = -dy + cx; sy =  dx + cy; break;  // 90° CW:  (dx,dy)→(−dy,dx)
+        case 270: sx =  dy + cx; sy = -dx + cy; break;  // 270° CW: (dx,dy)→(dy,−dx)
         default:  sx =  dx + cx; sy =  dy + cy; break;
     }
 
@@ -107,13 +106,23 @@ bool LandscapePageLayout::screen_to_page_coords(int sx, int sy, int page_index,
     float dx = sx - cx, dy = sy - cy;
     float rx, ry;
     switch (_angle) {
-        case  90: rx =  dy + cx; ry = -dx + cy; break;  // inverse of 90 CW = 90 CCW
-        case 180: rx = -dx + cx; ry = -dy + cy; break;
-        case 270: rx = -dy + cx; ry =  dx + cy; break;
+        case  90: rx =  dy + cx; ry = -dx + cy; break;  // inverse of 90° CW
+        case 270: rx = -dy + cx; ry =  dx + cy; break;  // inverse of 270° CW
         default:  rx =  dx + cx; ry =  dy + cy; break;
     }
 
     *px = (rx - (cx - w * 0.5f)) / zoom;
     *py = (ry - (cy - h * 0.5f)) / zoom;
     return (*px >= 0.f && *py >= 0.f && *px <= page_bounds.x1 && *py <= page_bounds.y1);
+}
+
+// Pan the (rotated) page directly in screen space, clamped to the screen.
+void LandscapePageLayout::pan_by_screen(float dx, float dy) {
+    float pw = page_bounds.x1 * zoom, ph = page_bounds.y1 * zoom;
+    bool quarter = (_angle == 90 || _angle == 270);
+    float sw = quarter ? ph : pw;
+    float sh = quarter ? pw : ph;
+
+    page_center.x = (sw <= SCREEN_WIDTH)  ? SCREEN_WIDTH  / 2.0f : fmin(fmax(page_center.x + dx, SCREEN_WIDTH  - sw / 2), sw / 2);
+    page_center.y = (sh <= SCREEN_HEIGHT) ? SCREEN_HEIGHT / 2.0f : fmin(fmax(page_center.y + dy, SCREEN_HEIGHT - sh / 2), sh / 2);
 }

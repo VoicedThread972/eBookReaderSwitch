@@ -13,6 +13,7 @@ class LandscapePageLayout: public PageLayout
         SDL_Rect page_rect_to_screen(const fz_rect &r, int page_index) const override;
         bool     screen_to_page_coords(int sx, int sy, int page_index,
                                        float *px, float *py) const override;
+        void     pan_by_screen(float dx, float dy) override;
     
     protected:
         void move_page(float x, float y);

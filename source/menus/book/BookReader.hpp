@@ -42,6 +42,12 @@ class BookReader {
         void next_page(int n);
         void zoom_in();
         void zoom_out();
+        void zoom_in_at(int ax, int ay);
+        void zoom_out_at(int ax, int ay);
+        void zoom_by_ratio_at(float ratio, int ax, int ay);
+        void pan(float dx, float dy);
+        bool at_edge(float dx, float dy);
+        bool is_zoomed() const;
         void move_page_up();
         void move_page_down();
         void move_page_left();
@@ -51,7 +57,7 @@ class BookReader {
         void draw(bool drawHelp, const ReaderOverlay &overlay);
 
         BookPageLayout currentPageLayout() const {
-            return (_rotation == 0) ? BookPageLayoutPortrait : BookPageLayoutLandscape;
+            return (_rotation == 0 || _rotation == 180) ? BookPageLayoutPortrait : BookPageLayoutLandscape;
         }
 
         int rotation() const { return _rotation; }
@@ -65,11 +71,18 @@ class BookReader {
         // Force a full link-list reload (e.g. after an external layout change).
         void reload_links();
 
+        // Rebuild the layout for the current rotation (also reloads links).
+        void refresh_layout();
+
+        // Read saved reading progress for a book path without opening it.
+        static void GetSavedProgress(const char *path, int *current_page, int *total_pages);
+
         const std::vector<LinkInfo>& page_links() const { return cached_links_; }
 
     private:
         void show_status_bar();
         void apply_rotation(int rotation, int current_page);
+        void sync_link_cache_for_visible_pages();
 
         void load_page_links();           // full mupdf query for current page(s)
         void recompute_link_screen_rects(); // cheap: recompute screen_rect after pan/zoom
@@ -79,6 +92,8 @@ class BookReader {
 
         int        _rotation = 0;
         PageLayout *layout   = NULL;
+        int         links_page0_ = -1;
+        int         links_page1_ = -1;
 
         std::string           book_name;
         std::vector<LinkInfo> cached_links_;

@@ -36,6 +36,13 @@ typedef struct {
 typedef struct {
     bool active;
     bool repeated;
+    bool moved;
+    bool panning;
+    bool suppress;      // ignore gesture after multi-touch until full release
+    bool pinching;
+    float pinch_last_dist;
+    int pinch_last_mx;
+    int pinch_last_my;
     u32 finger_id;
     int start_x;
     int start_y;
@@ -43,6 +50,14 @@ typedef struct {
     int last_y;
     Uint32 start_ms;
     PageHold hold;
+    bool edge_lock_set;
+    bool edge_turn_allowed;
+    int edge_swipe_direction;
+    float edge_px;
+    float edge_py;
+    float inertia_vx;
+    float inertia_vy;
+    bool inertia_active;
 } TouchGesture;
 
 static void reset_page_hold(PageHold *hold) {
@@ -95,52 +110,70 @@ static bool process_page_hold(BookReader *reader, PageHold *hold, Uint32 now) {
     return true;
 }
 
-static int page_tap_direction(BookPageLayout layout, int x, int y) {
-    if (layout == BookPageLayoutPortrait) {
-        if (y < TAP_TOP_SAFE || y > TAP_BOTTOM_SAFE) {
+// Tap-zone direction for each rotation angle.
+// Returns +1 (next page), -1 (prev page), or 0 (neutral zone).
+static int page_tap_direction(int rotation, int x, int y) {
+    switch (rotation) {
+        case 0:   // Normal spread: left = prev, right = next
+            if (y < TAP_TOP_SAFE || y > TAP_BOTTOM_SAFE) return 0;
+            if (x <= TAP_SIDE_WIDTH) return -1;
+            if (x >= SCREEN_WIDTH - TAP_SIDE_WIDTH) return 1;
             return 0;
-        }
-
-        if (x <= TAP_SIDE_WIDTH) {
-            return -1;
-        }
-
-        if (x >= SCREEN_WIDTH - TAP_SIDE_WIDTH) {
-            return 1;
-        }
-
-        return 0;
+        case 90:  // CW 90°: top = prev, bottom = next
+            if (x < ROTATED_TAP_LEFT_SAFE || x > ROTATED_TAP_RIGHT_SAFE) return 0;
+            if (y <= ROTATED_TAP_EDGE) return -1;
+            if (y >= SCREEN_HEIGHT - ROTATED_TAP_EDGE) return 1;
+            return 0;
+        case 180: // 180° spread: left = next, right = prev (reversed)
+            if (y < TAP_TOP_SAFE || y > TAP_BOTTOM_SAFE) return 0;
+            if (x <= TAP_SIDE_WIDTH) return 1;
+            if (x >= SCREEN_WIDTH - TAP_SIDE_WIDTH) return -1;
+            return 0;
+        case 270: // CW 270°: top = next, bottom = prev
+            if (x < ROTATED_TAP_LEFT_SAFE || x > ROTATED_TAP_RIGHT_SAFE) return 0;
+            if (y <= ROTATED_TAP_EDGE) return 1;
+            if (y >= SCREEN_HEIGHT - ROTATED_TAP_EDGE) return -1;
+            return 0;
     }
-
-    if (x < ROTATED_TAP_LEFT_SAFE || x > ROTATED_TAP_RIGHT_SAFE) {
-        return 0;
-    }
-
-    if (y <= ROTATED_TAP_EDGE) {
-        return -1;
-    }
-
-    if (y >= SCREEN_HEIGHT - ROTATED_TAP_EDGE) {
-        return 1;
-    }
-
     return 0;
 }
 
-static int page_swipe_direction(BookPageLayout layout, int dx, int dy) {
-    if (layout == BookPageLayoutPortrait) {
-        if (abs(dx) < SWIPE_DISTANCE || abs(dx) < abs(dy)) {
-            return 0;
-        }
-
-        return dx < 0 ? 1 : -1;
+static int page_swipe_direction(int rotation, int dx, int dy) {
+    switch (rotation) {
+        case 0:   // swipe left = next
+            if (abs(dx) < SWIPE_DISTANCE || abs(dx) < abs(dy)) return 0;
+            return dx < 0 ? 1 : -1;
+        case 90:  // swipe up = next
+            if (abs(dy) < SWIPE_DISTANCE || abs(dy) < abs(dx)) return 0;
+            return dy < 0 ? 1 : -1;
+        case 180: // swipe right = next (reversed from 0°)
+            if (abs(dx) < SWIPE_DISTANCE || abs(dx) < abs(dy)) return 0;
+            return dx > 0 ? 1 : -1;
+        case 270: // swipe down = next (reversed from 90°)
+            if (abs(dy) < SWIPE_DISTANCE || abs(dy) < abs(dx)) return 0;
+            return dy > 0 ? 1 : -1;
     }
+    return 0;
+}
 
-    if (abs(dy) < SWIPE_DISTANCE || abs(dy) < abs(dx)) {
-        return 0;
+// Same mapping as page_swipe_direction, but without distance thresholds.
+static int page_swipe_direction_dominant_only(int rotation, int dx, int dy) {
+    if (dx == 0 && dy == 0) return 0;
+    switch (rotation) {
+        case 0:
+            if (abs(dx) < abs(dy)) return 0;
+            return dx < 0 ? 1 : -1;
+        case 90:
+            if (abs(dy) < abs(dx)) return 0;
+            return dy < 0 ? 1 : -1;
+        case 180:
+            if (abs(dx) < abs(dy)) return 0;
+            return dx > 0 ? 1 : -1;
+        case 270:
+            if (abs(dy) < abs(dx)) return 0;
+            return dy > 0 ? 1 : -1;
     }
-
-    return dy < 0 ? 1 : -1;
+    return 0;
 }
 
 void Menu_OpenBook(char *path) {
@@ -160,11 +193,10 @@ void Menu_OpenBook(char *path) {
     bool helpMenu = false;
     TouchGesture touch = {0};
     PageHold buttonHold = {0};
-    // Virtual cursor (ZR + right stick) and link tab navigation (ZL + d-pad).
-    float cursor_x = 640.f, cursor_y = 360.f;
-    bool  cursor_mode    = false;
-    bool  link_tab_mode  = false;
-    int   focused_link   = -1;
+    float cursor_x = 640.f, cursor_y = 360.f;  // virtual cursor / "mouse"
+    int   focused_link = -1;                    // D-pad-selected link index
+    Uint32 last_mouse_activity = SDL_GetTicks(); // for idle-hide of cursor+links
+    const Uint32 CURSOR_IDLE_MS = 2000;
     
     // Configure our supported input layout: a single player with standard controller syles
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -172,23 +204,19 @@ void Menu_OpenBook(char *path) {
     PadState pad;
     padInitializeDefault(&pad);
 
+    // Some documents return no links on the very first query; retry briefly so
+    // hyperlink hitboxes work without needing a manual orientation change.
+    Uint32 link_retry_deadline = SDL_GetTicks() + 3000;
+    Uint32 last_link_retry = 0;
+
     while(result >= 0 && appletMainLoop()) {
-        // Clamp focused link in case page changed since last frame.
-        if (link_tab_mode) {
+        // Clamp focused link in case the page changed since last frame.
+        {
             int n = (int)reader->page_links().size();
-            if (n == 0)                                      focused_link = -1;
-            else if (focused_link < 0 || focused_link >= n)  focused_link = 0;
+            if (n == 0) focused_link = -1;
+            else if (focused_link >= n) focused_link = 0;
         }
 
-        ReaderOverlay overlay;
-        overlay.show_link_rects = (cursor_mode || link_tab_mode) && !helpMenu;
-        overlay.focused_link    = link_tab_mode ? focused_link : -1;
-        overlay.cursor_visible  = cursor_mode && !helpMenu;
-        overlay.cursor_x        = (int)cursor_x;
-        overlay.cursor_y        = (int)cursor_y;
-
-        reader->draw(helpMenu, overlay);
-        
 	padUpdate(&pad);
 
 	u64 kDown = padGetButtonsDown(&pad);
@@ -199,57 +227,178 @@ void Menu_OpenBook(char *path) {
     hidGetTouchScreenStates(&state, 1);
     Uint32 now = SDL_GetTicks();
 
-    // ── Virtual cursor movement via right stick ────────────────────────────
-    if (cursor_mode && !helpMenu) {
-        HidAnalogStickState rs = padGetStickPos(&pad, 1);
+    // Retry loading links for the first few seconds while they are still empty.
+    if (!helpMenu && reader->page_links().empty() && now < link_retry_deadline) {
+        if (now - last_link_retry >= 200) {
+            reader->reload_links();
+            last_link_retry = now;
+        }
+    }
+
+    // ── Left stick drives the virtual cursor / "mouse" ───────────────────────
+    if (!helpMenu) {
+        HidAnalogStickState ls = padGetStickPos(&pad, 0);
         const int DZ = 3000;
         auto axis = [DZ](int v) -> float {
             if (v >  DZ) return  (float)(v - DZ) / (32767 - DZ);
             if (v < -DZ) return  (float)(v + DZ) / (32767 - DZ);
             return 0.f;
         };
-        cursor_x = std::clamp(cursor_x + axis(rs.x) * 8.f, 0.f, 1279.f);
-        cursor_y = std::clamp(cursor_y - axis(rs.y) * 8.f, 0.f, 719.f);
-    }
+        float mvx = axis(ls.x), mvy = axis(ls.y);
+        if (mvx != 0.f || mvy != 0.f) {
+            float prev_x = cursor_x, prev_y = cursor_y;
+            cursor_x = std::clamp(cursor_x + mvx * 8.f, 0.f, 1279.f);
+            cursor_y = std::clamp(cursor_y - mvy * 8.f, 0.f, 719.f);
+            last_mouse_activity = now;
 
-    if (!helpMenu && state.count > 0) {
-        HidTouchState current_touch = state.touches[0];
-
-        if (!touch.active) {
-            touch.active = true;
-            touch.repeated = false;
-            touch.finger_id = current_touch.finger_id;
-            touch.start_x = current_touch.x;
-            touch.start_y = current_touch.y;
-            touch.last_x = current_touch.x;
-            touch.last_y = current_touch.y;
-            touch.start_ms = now;
-            start_page_hold(&touch.hold, page_tap_direction(reader->currentPageLayout(), current_touch.x, current_touch.y), now);
-        } else {
-            touch.last_x = current_touch.x;
-            touch.last_y = current_touch.y;
-
-            if (abs(touch.last_x - touch.start_x) > TAP_SLOP || abs(touch.last_y - touch.start_y) > TAP_SLOP) {
-                reset_page_hold(&touch.hold);
-            } else if (process_page_hold(reader, &touch.hold, now)) {
-                touch.repeated = true;
+            // When zoomed and the cursor is pinned against a screen edge, keep
+            // pushing to pan the page (like a swipe) — never turns the page.
+            if (reader->is_zoomed()) {
+                const float EDGE_PAN = 9.f;
+                float cvx = cursor_x - prev_x; // 0 while pinned at an edge
+                float cvy = cursor_y - prev_y;
+                float pdx = 0.f, pdy = 0.f;
+                if (cvx == 0.f) {
+                    if (cursor_x <= 0.5f    && mvx < 0.f) pdx =  mvx * EDGE_PAN * -1.f;
+                    if (cursor_x >= 1278.5f && mvx > 0.f) pdx = -mvx * EDGE_PAN;
+                }
+                if (cvy == 0.f) {
+                    if (cursor_y <= 0.5f    && mvy > 0.f) pdy =  mvy * EDGE_PAN;
+                    if (cursor_y >= 718.5f  && mvy < 0.f) pdy =  mvy * EDGE_PAN;
+                }
+                if (pdx != 0.f || pdy != 0.f) reader->pan(pdx, pdy);
             }
         }
-    } else if (touch.active) {
+    }
+
+    if (!helpMenu && state.count >= 2) {
+        // ── Pinch to zoom, anchored at the midpoint (phone-like) ─────────────
+        HidTouchState a = state.touches[0];
+        HidTouchState b = state.touches[1];
+        float dist = hypotf((float)b.x - (float)a.x, (float)b.y - (float)a.y);
+        int mx = (a.x + b.x) / 2;
+        int my = (a.y + b.y) / 2;
+
+        if (!touch.pinching) {
+            touch.pinching = true;
+            touch.pinch_last_dist = dist;
+            touch.pinch_last_mx = mx;
+            touch.pinch_last_my = my;
+            reset_page_hold(&touch.hold);
+            touch.active = false;
+            touch.inertia_active = false;
+            touch.inertia_vx = 0.f;
+            touch.inertia_vy = 0.f;
+        } else {
+            if (touch.pinch_last_dist > 1.f && dist > 1.f) {
+                reader->zoom_by_ratio_at(dist / touch.pinch_last_dist, mx, my);
+            }
+            // Move the zoom focus with the pinch midpoint (single-gesture pan).
+            float pan_dx = (float)(mx - touch.pinch_last_mx);
+            float pan_dy = (float)(my - touch.pinch_last_my);
+            reader->pan(pan_dx, pan_dy);
+            touch.inertia_vx = touch.inertia_vx * 0.72f + pan_dx * 0.28f;
+            touch.inertia_vy = touch.inertia_vy * 0.72f + pan_dy * 0.28f;
+            touch.pinch_last_dist = dist;
+            touch.pinch_last_mx = mx;
+            touch.pinch_last_my = my;
+        }
+        touch.suppress = true;   // don't fire a swipe when the fingers lift
+    } else if (!helpMenu && state.count == 1) {
+        HidTouchState current_touch = state.touches[0];
+        touch.pinching = false;
+
+        if (touch.suppress) {
+            // A finger from the pinch remains; ignore until full release.
+        } else if (!touch.active) {
+            touch.active = true;
+            touch.repeated = false;
+            touch.moved = false;
+            touch.panning = false;
+            touch.edge_lock_set = false;
+            touch.edge_turn_allowed = false;
+            touch.edge_swipe_direction = 0;
+            touch.edge_px = 0.f;
+            touch.edge_py = 0.f;
+            touch.finger_id = current_touch.finger_id;
+            touch.start_x = touch.last_x = current_touch.x;
+            touch.start_y = touch.last_y = current_touch.y;
+            touch.start_ms = now;
+            touch.inertia_active = false;
+            touch.inertia_vx = 0.f;
+            touch.inertia_vy = 0.f;
+            start_page_hold(&touch.hold, page_tap_direction(reader->rotation(), current_touch.x, current_touch.y), now);
+        } else {
+            int dx_move = current_touch.x - touch.last_x;
+            int dy_move = current_touch.y - touch.last_y;
+
+            if (abs((int)current_touch.x - touch.start_x) > TAP_SLOP ||
+                abs((int)current_touch.y - touch.start_y) > TAP_SLOP) {
+                touch.moved = true;
+                reset_page_hold(&touch.hold);
+            }
+
+            if (reader->is_zoomed() && touch.moved) {
+                // Pan the zoomed page so content follows the finger.
+                touch.panning = true;
+
+                if (!touch.edge_lock_set) {
+                    int dx0 = current_touch.x - touch.start_x;
+                    int dy0 = current_touch.y - touch.start_y;
+                    if (abs(dx0) >= abs(dy0)) {
+                        touch.edge_px = (dx0 < 0) ? -8.f : 8.f;
+                        touch.edge_py = 0.f;
+                    } else {
+                        touch.edge_px = 0.f;
+                        touch.edge_py = (dy0 < 0) ? -8.f : 8.f;
+                    }
+                    touch.edge_swipe_direction = page_swipe_direction_dominant_only(reader->rotation(), dx0, dy0);
+                    touch.edge_turn_allowed = reader->at_edge(touch.edge_px, touch.edge_py);
+                    touch.edge_lock_set = true;
+                }
+
+                reader->pan((float)dx_move, (float)dy_move);
+                touch.inertia_vx = touch.inertia_vx * 0.72f + (float)dx_move * 0.28f;
+                touch.inertia_vy = touch.inertia_vy * 0.72f + (float)dy_move * 0.28f;
+            } else if (!reader->is_zoomed() && !touch.moved &&
+                       process_page_hold(reader, &touch.hold, now)) {
+                touch.repeated = true;
+            }
+
+            touch.last_x = current_touch.x;
+            touch.last_y = current_touch.y;
+        }
+    } else if (touch.active || touch.suppress) {
+        // ── Release ──────────────────────────────────────────────────────────
         int dx = touch.last_x - touch.start_x;
         int dy = touch.last_y - touch.start_y;
         Uint32 duration = now - touch.start_ms;
 
-        if (!touch.repeated) {
-            int direction = page_swipe_direction(reader->currentPageLayout(), dx, dy);
+        if (touch.suppress) {
+            // Came out of a pinch; consume the release without action.
+            if (reader->is_zoomed() && (fabsf(touch.inertia_vx) > 0.15f || fabsf(touch.inertia_vy) > 0.15f)) {
+                touch.inertia_active = true;
+            }
+        } else if (touch.panning) {
+            // Edge lock is decided at gesture start; it cannot flip mid-gesture.
+            int direction = touch.edge_swipe_direction;
+            int final_direction = page_swipe_direction(reader->rotation(), dx, dy);
+            if (touch.edge_turn_allowed && direction != 0 && final_direction == direction) {
+                turn_pages(reader, direction, 1);
+            } else if (reader->is_zoomed() && (fabsf(touch.inertia_vx) > 0.15f || fabsf(touch.inertia_vy) > 0.15f)) {
+                touch.inertia_active = true;
+            }
+        } else if (!touch.repeated) {
+            int direction = page_swipe_direction(reader->rotation(), dx, dy);
 
             if (direction == 0 && duration <= TAP_MAX_MS && abs(dx) <= TAP_SLOP && abs(dy) <= TAP_SLOP) {
                 // Hyperlink taps take priority over page-turn taps.
                 std::string link_uri = reader->hit_link(touch.start_x, touch.start_y);
                 if (!link_uri.empty()) {
                     reader->follow_link(link_uri.c_str());
+                    last_mouse_activity = now;
                 } else {
-                    direction = page_tap_direction(reader->currentPageLayout(), touch.start_x, touch.start_y);
+                    direction = page_tap_direction(reader->rotation(), touch.start_x, touch.start_y);
                     turn_pages(reader, direction, 1);
                 }
             } else {
@@ -259,8 +408,29 @@ void Menu_OpenBook(char *path) {
 
         touch.active = false;
         touch.repeated = false;
+        touch.moved = false;
+        touch.panning = false;
+        touch.suppress = false;
+        touch.pinching = false;
+        touch.edge_lock_set = false;
+        touch.edge_turn_allowed = false;
+        touch.edge_swipe_direction = 0;
+        touch.edge_px = 0.f;
+        touch.edge_py = 0.f;
         reset_page_hold(&touch.hold);
     }
+
+        // Let zoomed panning coast down naturally after finger release.
+        if (!helpMenu && touch.inertia_active && reader->is_zoomed() && state.count == 0) {
+            reader->pan(touch.inertia_vx, touch.inertia_vy);
+            touch.inertia_vx *= 0.88f;
+            touch.inertia_vy *= 0.88f;
+            if (fabsf(touch.inertia_vx) < 0.05f && fabsf(touch.inertia_vy) < 0.05f) {
+                touch.inertia_active = false;
+                touch.inertia_vx = 0.f;
+                touch.inertia_vy = 0.f;
+            }
+        }
 
         if (!helpMenu && kDown & HidNpadButton_Left) {
             reader->previous_page(1);
@@ -276,51 +446,34 @@ void Menu_OpenBook(char *path) {
             reset_page_hold(&buttonHold);
         }
 
-        // ── ZR: toggle virtual cursor mode (right stick moves cursor, A follows) ──
-        if (!helpMenu && (kDown & HidNpadButton_ZR)) {
-            cursor_mode = !cursor_mode;
-            if (cursor_mode) {
-                link_tab_mode = false;
-                focused_link  = -1;
-                cursor_x = 640.f; cursor_y = 360.f;
-            }
-        }
-
-        // ── ZL: toggle link tab-navigation mode (d-pad cycles, A follows) ──────
-        if (!helpMenu && (kDown & HidNpadButton_ZL)) {
-            link_tab_mode = !link_tab_mode;
-            if (link_tab_mode) {
-                cursor_mode  = false;
-                const auto &lks = reader->page_links();
-                focused_link = lks.empty() ? -1 : 0;
-            } else {
-                focused_link = -1;
-            }
-        }
-
-        // ── A: follow focused/hovered link ───────────────────────────────────────
+        // ── A: follow the hyperlink at the cursor, or the D-pad focused one ─────
         if (!helpMenu && (kDown & HidNpadButton_A)) {
-            if (cursor_mode) {
-                std::string uri = reader->hit_link((int)cursor_x, (int)cursor_y);
-                if (!uri.empty()) {
-                    reader->follow_link(uri.c_str());
-                    cursor_mode = false;
-                }
-            } else if (link_tab_mode && focused_link >= 0) {
+            std::string uri = reader->hit_link((int)cursor_x, (int)cursor_y);
+            if (uri.empty() && focused_link >= 0) {
                 const auto &lks = reader->page_links();
-                if (focused_link < (int)lks.size())
-                    reader->follow_link(lks[focused_link].uri.c_str());
-                link_tab_mode = false;
-                focused_link  = -1;
+                if (focused_link < (int)lks.size()) uri = lks[focused_link].uri;
+            }
+            if (!uri.empty()) {
+                reader->follow_link(uri.c_str());
+                last_mouse_activity = now;
             }
         }
 
-        // ── D-pad cycles links in tab mode (up/down repurposed when tab active) ─
-        if (!helpMenu && link_tab_mode) {
-            int n = (int)reader->page_links().size();
+        // ── D-pad up/down cycles hyperlinks; cursor jumps to the focused one ───
+        if (!helpMenu) {
+            const auto &lks = reader->page_links();
+            int n = (int)lks.size();
             if (n > 0) {
-                if (kDown & HidNpadButton_Down) focused_link = (focused_link + 1) % n;
-                if (kDown & HidNpadButton_Up)   focused_link = ((focused_link - 1) + n) % n;
+                int prev = focused_link;
+                if (kDown & HidNpadButton_Down)
+                    focused_link = (focused_link < 0) ? 0 : (focused_link + 1) % n;
+                else if (kDown & HidNpadButton_Up)
+                    focused_link = (focused_link < 0) ? n-1 : ((focused_link - 1) + n) % n;
+                if (focused_link != prev && focused_link >= 0) {
+                    cursor_x = lks[focused_link].screen_rect.x + lks[focused_link].screen_rect.w * 0.5f;
+                    cursor_y = lks[focused_link].screen_rect.y + lks[focused_link].screen_rect.h * 0.5f;
+                    last_mouse_activity = now;
+                }
             }
         }
 
@@ -330,41 +483,11 @@ void Menu_OpenBook(char *path) {
             reader->previous_page(10);
         }
 
-        if (!helpMenu && !link_tab_mode && ((kDown & HidNpadButton_Up) || (!cursor_mode && kHeld & HidNpadButton_StickRUp))) {
-            if (reader->currentPageLayout() == BookPageLayoutPortrait ) {
-                reader->zoom_in();
-            } else if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
-                reader->previous_page(1);
-            }
-        } else if (!helpMenu && !link_tab_mode && ((kDown & HidNpadButton_Down) || (!cursor_mode && kHeld & HidNpadButton_StickRDown))) {
-            if (reader->currentPageLayout() == BookPageLayoutPortrait ) {
-                reader->zoom_out();
-            } else if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
-                reader->next_page(1);
-            }
-        }
+        // ── Right stick: zoom, anchored at the virtual cursor ──────────────────────
+        if (!helpMenu && (kHeld & HidNpadButton_StickRUp))   { reader->zoom_in_at((int)cursor_x, (int)cursor_y);  last_mouse_activity = now; }
+        if (!helpMenu && (kHeld & HidNpadButton_StickRDown)) { reader->zoom_out_at((int)cursor_x, (int)cursor_y); last_mouse_activity = now; }
 
-        if (!helpMenu && kHeld & HidNpadButton_StickLUp) {
-            if (reader->currentPageLayout() == BookPageLayoutPortrait ) {
-                reader->move_page_up();
-            } else if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
-                reader->move_page_right();
-            }
-        } else if (!helpMenu && kHeld & HidNpadButton_StickLDown) {
-            if (reader->currentPageLayout() == BookPageLayoutPortrait ) {
-                reader->move_page_down();
-            } else if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
-                reader->move_page_left();
-            }
-        } else if (!helpMenu && kHeld & HidNpadButton_StickLRight) {
-            if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
-                reader->move_page_down();
-            }
-        } else if (!helpMenu && kHeld & HidNpadButton_StickLLeft) {
-            if ((reader->currentPageLayout() == BookPageLayoutLandscape) ) {
-                reader->move_page_up();
-            }
-        }
+        // (Left-stick panning removed; left stick is now the virtual cursor.)
 
 	if (!helpMenu && kDown & HidNpadButton_LeftSR)
 		reader->next_page(10);
@@ -399,6 +522,15 @@ void Menu_OpenBook(char *path) {
         if (kDown & HidNpadButton_Plus) {
             helpMenu = !helpMenu;
         }
+
+        ReaderOverlay overlay;
+        bool cursor_active = (SDL_GetTicks() - last_mouse_activity) < CURSOR_IDLE_MS;
+        overlay.show_link_rects = cursor_active && !reader->page_links().empty() && !helpMenu;
+        overlay.focused_link    = focused_link;
+        overlay.cursor_visible  = cursor_active && !helpMenu;
+        overlay.cursor_x        = (int)cursor_x;
+        overlay.cursor_y        = (int)cursor_y;
+        reader->draw(helpMenu, overlay);
  
         /*if (touchInfo.state == TouchEnded && touchInfo.tapType != TapNone) {
             float tapRegion = 120;

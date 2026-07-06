@@ -19,13 +19,28 @@ int windowX, windowY;
 config_t *config = NULL;
 const char* configFile = "/switch/eBookReader/saved_pages.cfg";
 
-static int load_last_page(const char *book_name)  {
+static void ensure_config() {
     if (!config) {
         config = (config_t *)malloc(sizeof(config_t));
         config_init(config);
         config_read_file(config, configFile);
     }
-    
+}
+
+// Strip the directory and any characters libconfig cannot use in a setting name
+// so the same book always maps to the same key.
+static std::string sanitize_book_name(const std::string &path) {
+    std::string name = path.substr(path.find_last_of("/\\") + 1);
+    std::string invalid_chars = " :/?#[]@!$&'()*+,;=.";
+    for (char &c : invalid_chars) {
+        name.erase(std::remove(name.begin(), name.end(), c), name.end());
+    }
+    return name;
+}
+
+static int load_last_page(const char *book_name)  {
+    ensure_config();
+
     config_setting_t *setting = config_setting_get_member(config_root_setting(config), book_name);
     
     if (setting) {
@@ -35,17 +50,48 @@ static int load_last_page(const char *book_name)  {
     return 0;
 }
 
-static void save_last_page(const char *book_name, int current_page) {
-    config_setting_t *setting = config_setting_get_member(config_root_setting(config), book_name);
+static void save_last_page(const char *book_name, int current_page, int total_pages) {
+    ensure_config();
+
+    config_setting_t *root = config_root_setting(config);
+    config_setting_t *setting = config_setting_get_member(root, book_name);
     
     if (!setting) {
-        setting = config_setting_add(config_root_setting(config), book_name, CONFIG_TYPE_INT);
+        setting = config_setting_add(root, book_name, CONFIG_TYPE_INT);
     }
     
     if (setting) {
         config_setting_set_int(setting, current_page);
-        config_write_file(config, configFile);
     }
+
+    // Persist the total page count under a companion key so the chooser can
+    // display reading progress without opening every document.
+    std::string total_key = std::string(book_name) + "__total";
+    config_setting_t *total = config_setting_get_member(root, total_key.c_str());
+    if (!total) {
+        total = config_setting_add(root, total_key.c_str(), CONFIG_TYPE_INT);
+    }
+    if (total) {
+        config_setting_set_int(total, total_pages);
+    }
+
+    config_write_file(config, configFile);
+}
+
+void BookReader::GetSavedProgress(const char *path, int *current_page, int *total_pages) {
+    if (current_page) *current_page = 0;
+    if (total_pages)  *total_pages  = 0;
+
+    ensure_config();
+    std::string name = sanitize_book_name(path);
+
+    config_setting_t *root = config_root_setting(config);
+    config_setting_t *p = config_setting_get_member(root, name.c_str());
+    if (p && current_page) *current_page = config_setting_get_int(p);
+
+    std::string total_key = name + "__total";
+    config_setting_t *t = config_setting_get_member(root, total_key.c_str());
+    if (t && total_pages) *total_pages = config_setting_get_int(t);
 }
 
 BookReader::BookReader(const char *path, int* result) {
@@ -56,12 +102,7 @@ BookReader::BookReader(const char *path, int* result) {
 
     SDL_GetWindowSize(WINDOW, &windowX, &windowY);
     
-    book_name = std::string(path).substr(std::string(path).find_last_of("/\\") + 1);
-    
-    std::string invalid_chars = " :/?#[]@!$&'()*+,;=.";
-    for (char& c: invalid_chars) {
-        book_name.erase(std::remove(book_name.begin(), book_name.end(), c), book_name.end());
-    }
+    book_name = sanitize_book_name(path);
     
     fz_try(ctx)	{
         std::cout << "fz_open_document" << std::endl;
@@ -101,25 +142,58 @@ BookReader::~BookReader() {
 void BookReader::previous_page(int n) {
     layout->previous_page(n);
     show_status_bar();
-    save_last_page(book_name.c_str(), layout->current_page());
-    recompute_link_screen_rects();
+    save_last_page(book_name.c_str(), layout->current_page(), layout->page_count());
+    load_page_links();
 }
 
 void BookReader::next_page(int n) {
     layout->next_page(n);
     show_status_bar();
-    save_last_page(book_name.c_str(), layout->current_page());
-    recompute_link_screen_rects();
+    save_last_page(book_name.c_str(), layout->current_page(), layout->page_count());
+    load_page_links();
 }
 
 void BookReader::zoom_in() {
     layout->zoom_in();
     show_status_bar();
+    recompute_link_screen_rects();
 }
 
 void BookReader::zoom_out() {
     layout->zoom_out();
     show_status_bar();
+    recompute_link_screen_rects();
+}
+
+void BookReader::zoom_in_at(int ax, int ay) {
+    layout->zoom_in_at((float)ax, (float)ay);
+    show_status_bar();
+    recompute_link_screen_rects();
+}
+
+void BookReader::zoom_out_at(int ax, int ay) {
+    layout->zoom_out_at((float)ax, (float)ay);
+    show_status_bar();
+    recompute_link_screen_rects();
+}
+
+void BookReader::zoom_by_ratio_at(float ratio, int ax, int ay) {
+    layout->set_zoom_ratio_at(ratio, (float)ax, (float)ay);
+    show_status_bar();
+    recompute_link_screen_rects();
+}
+
+void BookReader::pan(float dx, float dy) {
+    layout->pan_by_screen(dx, dy);
+    recompute_link_screen_rects();
+}
+
+bool BookReader::at_edge(float dx, float dy) {
+    return layout->at_screen_edge(dx, dy);
+}
+
+bool BookReader::is_zoomed() const {
+    return layout->is_zoomed();
 }
 
 void BookReader::move_page_up() {
@@ -162,6 +236,13 @@ void BookReader::draw(bool drawHelp, const ReaderOverlay &overlay) {
     SDL_RenderClear(RENDERER);
     
     layout->draw_page();
+
+    sync_link_cache_for_visible_pages();
+
+    // Keep link hitboxes in sync with the current layout geometry every frame
+    // (cheap: no mupdf queries). This guarantees correct positions from the
+    // first frame, without needing a rotation to "kick" them into place.
+    recompute_link_screen_rects();
 
     // Draw link highlight rectangles.
     if (overlay.show_link_rects && !cached_links_.empty()) {
@@ -264,11 +345,11 @@ void BookReader::apply_rotation(int rotation, int current_page) {
     
     _rotation = ((rotation % 360) + 360) % 360;
     
-    if (_rotation == 0) {
-        // Upright: two-page spread (landscape reading on the handheld).
-        layout = new PageLayout(doc, current_page);
+    if (_rotation == 0 || _rotation == 180) {
+        // 0° and 180° both show two-page spread; 180° renders each page upside-down.
+        layout = new PageLayout(doc, current_page, true, _rotation);
     } else {
-        // 90/180/270: single page rotated clockwise by that many degrees.
+        // 90° and 270°: single page rotated clockwise by that many degrees.
         layout = new LandscapePageLayout(doc, current_page, _rotation);
     }
 
@@ -280,6 +361,9 @@ void BookReader::apply_rotation(int rotation, int current_page) {
 void BookReader::load_page_links() {
     cached_links_.clear();
     if (!layout || !doc) return;
+
+    links_page0_ = layout->current_page();
+    links_page1_ = layout->second_page_number();
 
     auto process = [&](int page_num, int page_index) {
         if (page_num < 0) return;
@@ -299,8 +383,10 @@ void BookReader::load_page_links() {
             li.page_num   = page_num;
             li.page_index = page_index;
             li.screen_rect = layout->page_rect_to_screen(l->rect, page_index);
-            if (li.screen_rect.w > 0 && li.screen_rect.h > 0)
-                cached_links_.push_back(std::move(li));
+            // Store every link; the screen rect is refreshed every frame in
+            // draw(), so links must not be dropped just because the layout
+            // geometry is not final yet on the very first query.
+            cached_links_.push_back(std::move(li));
         }
         fz_drop_link(ctx, links);
         fz_drop_page(ctx, page);
@@ -308,6 +394,15 @@ void BookReader::load_page_links() {
 
     process(layout->current_page(), 0);
     process(layout->second_page_number(), 1);
+}
+
+void BookReader::sync_link_cache_for_visible_pages() {
+    if (!layout) return;
+    int p0 = layout->current_page();
+    int p1 = layout->second_page_number();
+    if (p0 != links_page0_ || p1 != links_page1_) {
+        load_page_links();
+    }
 }
 
 void BookReader::recompute_link_screen_rects() {
@@ -337,7 +432,7 @@ void BookReader::follow_link(const char *uri) {
         if (pn >= 0 && pn < fz_count_pages(ctx, doc)) {
             layout->go_to_page(pn);
             show_status_bar();
-            save_last_page(book_name.c_str(), layout->current_page());
+            save_last_page(book_name.c_str(), layout->current_page(), layout->page_count());
             load_page_links();
         }
     }
@@ -346,4 +441,10 @@ void BookReader::follow_link(const char *uri) {
 
 void BookReader::reload_links() {
     load_page_links();
+}
+
+void BookReader::refresh_layout() {
+    if (layout) {
+        apply_rotation(_rotation, layout->current_page());
+    }
 }

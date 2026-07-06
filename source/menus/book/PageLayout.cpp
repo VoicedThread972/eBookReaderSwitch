@@ -32,7 +32,7 @@ static SDL_Texture* render_page_texture(fz_page *page, float zoom) {
     return texture;
 }
 
-PageLayout::PageLayout(fz_document *doc, int current_page, bool spread_mode):doc(doc),pdf(pdf_specifics(ctx, doc)),pages_count(fz_count_pages(ctx, doc)),spread_mode(spread_mode) {
+PageLayout::PageLayout(fz_document *doc, int current_page, bool spread_mode, int draw_angle):doc(doc),pdf(pdf_specifics(ctx, doc)),pages_count(fz_count_pages(ctx, doc)),spread_mode(spread_mode),_draw_angle(draw_angle) {
     _current_page = std::min(std::max(0, current_page), pages_count - 1);
     
     SDL_RenderGetViewport(RENDERER, &viewport);
@@ -87,14 +87,22 @@ void PageLayout::reset() {
 };
 
 void PageLayout::draw_page() {
-    if (spread_mode) {
-        int w = 0, h = 0, w2 = 0, h2 = 0;
-        SDL_QueryTexture(page_texture, NULL, NULL, &w, &h);
-
-        bool has_second_page = second_page_texture != NULL;
-        if (has_second_page) {
-            SDL_QueryTexture(second_page_texture, NULL, NULL, &w2, &h2);
+    if (raster_pending) {
+        Uint32 now = SDL_GetTicks();
+        bool idle_after_input = (now - last_zoom_input_ms) > 70;
+        bool drift_large = fabsf(zoom - texture_zoom) > 0.18f;
+        bool cadence_ok = (now - last_raster_ms) > 45;
+        if (idle_after_input || (drift_large && cadence_ok)) {
+            render_page_to_texture(_current_page, false);
         }
+    }
+
+    if (spread_mode) {
+        float w = page_bounds.x1 * zoom;
+        float h = page_bounds.y1 * zoom;
+        bool has_second_page = second_page_bounds.x1 > 0.f && second_page_bounds.y1 > 0.f;
+        float w2 = has_second_page ? (second_page_bounds.x1 * zoom) : 0.f;
+        float h2 = has_second_page ? (second_page_bounds.y1 * zoom) : 0.f;
 
         float total_width = w + (has_second_page ? PAGE_SPREAD_GUTTER + w2 : 0);
         float spread_left = page_center.x - total_width / 2;
@@ -104,7 +112,7 @@ void PageLayout::draw_page() {
         rect.y = page_center.y - h / 2;
         rect.w = w;
         rect.h = h;
-        SDL_RenderCopy(RENDERER, page_texture, NULL, &rect);
+        SDL_RenderCopyEx(RENDERER, page_texture, NULL, &rect, _draw_angle, NULL, SDL_FLIP_NONE);
 
         if (has_second_page) {
             SDL_Rect second_rect;
@@ -112,7 +120,7 @@ void PageLayout::draw_page() {
             second_rect.y = page_center.y - h2 / 2;
             second_rect.w = w2;
             second_rect.h = h2;
-            SDL_RenderCopy(RENDERER, second_page_texture, NULL, &second_rect);
+            SDL_RenderCopyEx(RENDERER, second_page_texture, NULL, &second_rect, _draw_angle, NULL, SDL_FLIP_NONE);
         }
 
         return;
@@ -126,7 +134,7 @@ void PageLayout::draw_page() {
     rect.w = w;
     rect.h = h;
     
-    SDL_RenderCopy(RENDERER, page_texture, NULL, &rect);
+    SDL_RenderCopyEx(RENDERER, page_texture, NULL, &rect, _draw_angle, NULL, SDL_FLIP_NONE);
 }
 
 char* PageLayout::info() {
@@ -144,6 +152,12 @@ void PageLayout::render_page_to_texture(int num, bool reset_zoom) {
     FreeTextureIfNeeded(&second_page_texture);
     
     _current_page = std::min(std::max(0, num), pages_count - 1);
+
+    // In spread mode always start each spread on an even (0-based) page so that
+    // odd page numbers (1-based) stay on the left and even ones on the right.
+    if (spread_mode) {
+        _current_page -= (_current_page % 2);
+    }
 
     fz_page *page = fz_load_page(ctx, doc, _current_page);
     fz_rect bounds = fz_bound_page(ctx, page);
@@ -190,6 +204,10 @@ void PageLayout::render_page_to_texture(int num, bool reset_zoom) {
         second_page_texture = render_page_texture(second_page, zoom);
         fz_drop_page(ctx, second_page);
     }
+
+    texture_zoom = zoom;
+    last_raster_ms = SDL_GetTicks();
+    raster_pending = false;
     
     fz_drop_page(ctx, page);
 }
@@ -201,8 +219,9 @@ void PageLayout::set_zoom(float value) {
         return;
     
     zoom = value;
-    
-    render_page_to_texture(_current_page, false);
+
+    last_zoom_input_ms = SDL_GetTicks();
+    raster_pending = true;
     move_page(0, 0);
 }
 
@@ -210,16 +229,15 @@ void PageLayout::move_page(float x, float y) {
     float w = page_bounds.x1 * zoom, h = page_bounds.y1 * zoom;
 
     if (spread_mode) {
-        int texture_w = 0, texture_h = 0, second_texture_w = 0, second_texture_h = 0;
-        SDL_QueryTexture(page_texture, NULL, NULL, &texture_w, &texture_h);
-
-        if (second_page_texture) {
-            SDL_QueryTexture(second_page_texture, NULL, NULL, &second_texture_w, &second_texture_h);
-            w = texture_w + PAGE_SPREAD_GUTTER + second_texture_w;
-            h = fmax(texture_h, second_texture_h);
+        bool has_second_page = second_page_bounds.x1 > 0.f && second_page_bounds.y1 > 0.f;
+        if (has_second_page) {
+            float w2 = second_page_bounds.x1 * zoom;
+            float h2 = second_page_bounds.y1 * zoom;
+            w = w + PAGE_SPREAD_GUTTER + w2;
+            h = fmax(h, h2);
         } else {
-            w = texture_w;
-            h = texture_h;
+            w = page_bounds.x1 * zoom;
+            h = page_bounds.y1 * zoom;
         }
     }
 
@@ -266,11 +284,23 @@ SDL_Rect PageLayout::page_rect_to_screen(const fz_rect &r, int page_index) const
         ry = page_center.y - h / 2.f;
     }
 
+    // A 180° spread renders each page upside-down about its own centre, so mirror
+    // the link rect within page space before mapping it to the screen.
+    float max_x = (page_index == 1) ? second_page_bounds.x1 : page_bounds.x1;
+    float max_y = (page_index == 1) ? second_page_bounds.y1 : page_bounds.y1;
+    fz_rect rr = r;
+    if (_draw_angle == 180) {
+        rr.x0 = max_x - r.x1;
+        rr.x1 = max_x - r.x0;
+        rr.y0 = max_y - r.y1;
+        rr.y1 = max_y - r.y0;
+    }
+
     return {
-        (int)(rx + r.x0 * zoom),
-        (int)(ry + r.y0 * zoom),
-        (int)((r.x1 - r.x0) * zoom),
-        (int)((r.y1 - r.y0) * zoom)
+        (int)(rx + rr.x0 * zoom),
+        (int)(ry + rr.y0 * zoom),
+        (int)((rr.x1 - rr.x0) * zoom),
+        (int)((rr.y1 - rr.y0) * zoom)
     };
 }
 
@@ -307,5 +337,45 @@ bool PageLayout::screen_to_page_coords(int sx, int sy, int page_index,
 
     *px = (sx - rx) / zoom;
     *py = (sy - ry) / zoom;
+    if (_draw_angle == 180) {
+        *px = max_x - *px;
+        *py = max_y - *py;
+    }
     return (*px >= 0.f && *py >= 0.f && *px <= max_x && *py <= max_y);
+}
+
+// ── Zoom / pan helpers used by mouse-centred zoom, pinch and touch pan ─────────
+
+// Zoom to an absolute value while keeping the world point under (ax, ay) fixed.
+// Works for both portrait and landscape layouts because scaling and rotation
+// share the same centre (page_center).
+void PageLayout::set_zoom_at(float value, float ax, float ay) {
+    value = fmin(fmax(min_zoom, value), max_zoom);
+    if (value == zoom)
+        return;
+
+    float ratio = value / zoom;
+    page_center.x = ax + (page_center.x - ax) * ratio;
+    page_center.y = ay + (page_center.y - ay) * ratio;
+    zoom = value;
+
+    last_zoom_input_ms = SDL_GetTicks();
+    raster_pending = true;
+    move_page(0, 0); // clamp back into view
+}
+
+// Pan the page directly in screen space (clamped). Overridden for landscape.
+void PageLayout::pan_by_screen(float dx, float dy) {
+    move_page(dx, dy);
+}
+
+// True when a pan in the given screen direction cannot move the page any
+// further (i.e. the corresponding edge is already reached).
+bool PageLayout::at_screen_edge(float dx, float dy) {
+    fz_point before = page_center;
+    pan_by_screen(dx, dy);
+    bool moved = (fabsf(page_center.x - before.x) > 0.5f) ||
+                 (fabsf(page_center.y - before.y) > 0.5f);
+    page_center = before;
+    return !moved;
 }
